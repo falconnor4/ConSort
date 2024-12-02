@@ -5,7 +5,7 @@ async function conSort(elements) {
 
     // Configuration
     const minGroupSize = 3;           // Minimum size of each group
-    const sortScale = 2.0;            // Scale factor for number of sorts
+    const sortScale = 0.8;            // Scale factor for number of sorts
     const sortThreshold = 0.3;        // 30% threshold for full sort
 
     // Calculate number of sorts based on array size
