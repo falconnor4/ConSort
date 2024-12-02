@@ -1,24 +1,21 @@
 #version 460
 
-// Use subgroup operations if available for better performance
-#extension GL_KHR_shader_subgroup_basic : require
-#extension GL_KHR_shader_subgroup_arithmetic : require
-
 layout(local_size_x = 256) in;
 
-// Input/output buffer - std430 for tighter packing of data
+// Input/output buffer
 layout(std430, binding = 0) buffer DataBuffer {
     uint data[];
 };
 
-// Configuration uniforms - std140 for cross-platform compatibility
+// Configuration uniforms
 layout(std140, binding = 1) uniform ConfigBuffer {
     uint arraySize;        // Total size of the array
     float sortThreshold;   // Threshold for switching to full radix sort
+    uint minGroupSize;     // Minimum group size (e.g., 3)
+    float sortScale;       // Scale factor for number of sorts (e.g., 2.0)
 };
 
-// Fast random number generation using Wang hash
-// Returns a uniformly distributed random number
+// Random number generation
 uint wang_hash(uint seed) {
     seed = (seed ^ 61) ^ (seed >> 16);
     seed *= 9;
@@ -28,66 +25,64 @@ uint wang_hash(uint seed) {
     return seed;
 }
 
-// Optimized swap operation using multiple assignment
-void swap(uint index1, uint index2) {
-    uint temp = data[index1];
-    data[index1] = data[index2];
-    data[index2] = temp;
+// Swap operation
+void swap(uint a, uint b) {
+    uint temp = data[a];
+    data[a] = data[b];
+    data[b] = temp;
 }
 
 // Insertion sort for first elements of groups
-// Used to establish initial order between groups
 void insertionSortFirstElements(uint groupIndex, uint groupSize) {
-    // Cache the first element to reduce memory reads
     uint firstElement = data[groupIndex * groupSize];
     uint j = groupIndex;
     
-    while (j > 0) {
-        uint prevGroupFirst = data[(j-1) * groupSize];
-        if (prevGroupFirst <= firstElement) break;
-        
-        // Swap entire groups using unrolled loop for small groups
-        if (groupSize <= 4) {
-            #pragma unroll
-            for (uint k = 0; k < groupSize; k++) {
-                swap((j-1) * groupSize + k, j * groupSize + k);
-            }
-        } else {
-            for (uint k = 0; k < groupSize; k++) {
-                swap((j-1) * groupSize + k, j * groupSize + k);
-            }
+    while (j > 0 && data[(j-1) * groupSize] > firstElement) {
+        // Swap entire groups
+        for (uint k = 0; k < groupSize; k++) {
+            swap((j-1) * groupSize + k, j * groupSize + k);
         }
         j--;
     }
 }
 
-// Random radix sort within groups
-// Uses random sampling to approximate sorting
-void randomRadixSortGroup(uint groupStart, uint groupSize, uint numSorts) {
-    // Use thread ID and group start for better random distribution
-    uint seed = gl_GlobalInvocationID.x + groupStart;
-    
-    // Early exit if group is too small
+// Calculate number of sorts based on array size
+uint calculateSortsPerGroup() {
+    return uint(sqrt(float(arraySize)) * sortScale);
+}
+
+// Random sort within groups - only adjacent pairs
+void randomSortGroup(uint groupStart, uint groupSize, uint sortsPerGroup) {
     if (groupSize <= 1) return;
     
-    // Pre-calculate group bounds
-    uint groupEnd = groupStart + groupSize;
+    uint seed = gl_GlobalInvocationID.x + groupStart;
+    uint maxStartIdx = groupStart + groupSize - 2;
     
-    for (uint i = 0; i < numSorts; i++) {
-        // Generate random indices using a single hash operation
+    // Each group gets sortsPerGroup attempts
+    for (uint i = 0; i < sortsPerGroup; i++) {
         seed = wang_hash(seed);
-        uint combinedIndices = seed % (groupSize * groupSize);
-        uint idx1 = groupStart + (combinedIndices % groupSize);
-        uint idx2 = groupStart + (combinedIndices / groupSize);
+        // Pick random adjacent pair within group
+        uint idx = groupStart + (seed % (groupSize - 1));
         
-        // Ensure indices are within bounds and different
-        if (idx1 != idx2 && idx1 < groupEnd && idx2 < groupEnd) {
-            // Compare and swap if needed
-            if (data[idx1] > data[idx2]) {
-                swap(idx1, idx2);
-            }
+        // Compare and swap if needed
+        if (data[idx] > data[idx + 1]) {
+            swap(idx, idx + 1);
         }
     }
+}
+
+// Check if array section needs full sort
+bool needsFullSort(uint start, uint size) {
+    uint outOfOrder = 0;
+    uint threshold = uint(float(size) * sortThreshold);
+    
+    for (uint i = start + 1; i < start + size; i++) {
+        if (data[i] < data[i-1]) {
+            outOfOrder++;
+            if (outOfOrder > threshold) return true;
+        }
+    }
+    return false;
 }
 
 // Full radix sort implementation for when array is very unsorted
@@ -122,75 +117,25 @@ void radixSort(uint start, uint size) {
     }
 }
 
-// Calculate maximum sorts per group based on array size
-// Uses square root scaling for balanced distribution
-uint calculateMaxSortsPerGroup(uint size) {
-    return uint(sqrt(float(size))) * 2;
-}
-
-// Calculate maximum possible sorts for a given group size
-uint getMaxPossibleSorts(uint groupSize) {
-    return (groupSize * (groupSize - 1)) / 2;
-}
-
-// Calculate and accumulate extra sorts from smaller groups
-uint calculateExtraSorts(uint groupIndex, uint baseSorts) {
-    uint totalExtra = 0;
-    
-    // Process in chunks for better cache utilization
-    const uint CHUNK_SIZE = 64;
-    for (uint chunk = 0; chunk < groupIndex; chunk += CHUNK_SIZE) {
-        uint endChunk = min(chunk + CHUNK_SIZE, groupIndex);
-        
-        for (uint i = chunk; i < endChunk; i++) {
-            uint groupSize = i + 1;
-            uint maxPossible = getMaxPossibleSorts(groupSize);
-            if (baseSorts > maxPossible) {
-                totalExtra += baseSorts - maxPossible;
-            }
-        }
-    }
-    
-    return totalExtra;
-}
-
-// Check if array section needs full radix sort
-bool needsFullSort(uint start, uint size) {
-    if (size <= 1) return false;
-    
-    uint outOfOrder = 0;
-    uint threshold = uint(float(size) * sortThreshold);
-    
-    // Use local cache for frequent comparisons
-    uint prevValue = data[start];
-    
-    for (uint i = start + 1; i < start + size; i++) {
-        uint currentValue = data[i];
-        if (currentValue < prevValue) {
-            outOfOrder++;
-            if (outOfOrder > threshold) return true;
-        }
-        prevValue = currentValue;
-    }
-    return false;
-}
-
 void main() {
     uint gid = gl_GlobalInvocationID.x;
     if (gid >= arraySize) return;
     
-    // Calculate adaptive group parameters
+    // Calculate sort count first
+    uint sortsPerGroup = calculateSortsPerGroup();
+    
+    // Calculate group parameters
     uint groupIndex = gid;
-    uint groupSize = groupIndex + 1; // Linear group size scaling
+    uint groupSize = minGroupSize + groupIndex; // Linear growth starting from minGroupSize
     uint groupStart = groupIndex * groupSize;
     
-    // Early exit if group is beyond array bounds
+    // Early exit if beyond array bounds
     if (groupStart >= arraySize) return;
     
     // Adjust group size for array bounds
     groupSize = min(groupSize, arraySize - groupStart);
     
-    // Check if section needs full radix sort
+    // Check if section needs full sort
     if (needsFullSort(groupStart, groupSize)) {
         radixSort(groupStart, groupSize);
         return;
@@ -199,21 +144,8 @@ void main() {
     // Sort first elements of groups
     insertionSortFirstElements(groupIndex, groupSize);
     
-    // Calculate and apply sort allocations
-    uint baseSorts = calculateMaxSortsPerGroup(arraySize);
-    uint maxPossible = getMaxPossibleSorts(groupSize);
-    uint extraSorts = calculateExtraSorts(groupIndex, baseSorts);
+    // Random sort within group using calculated sort count
+    randomSortGroup(groupStart, groupSize, sortsPerGroup);
     
-    // Calculate additional sorts based on group weight
-    uint additionalSorts = 0;
-    if (maxPossible > baseSorts) {
-        float groupWeight = float(groupSize) / float(arraySize);
-        additionalSorts = uint(float(extraSorts) * groupWeight);
-    }
-    
-    uint totalSorts = min(maxPossible, baseSorts + additionalSorts);
-    randomRadixSortGroup(groupStart, groupSize, totalSorts);
-    
-    // Ensure all memory operations are complete
     memoryBarrier();
 }
