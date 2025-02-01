@@ -1,151 +1,67 @@
-#version 460
+#version 450
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+layout(binding = 0, std430) buffer SortBuffer { uint data[]; };
 
-layout(local_size_x = 256) in;
-
-// Input/output buffer
-layout(std430, binding = 0) buffer DataBuffer {
-    uint data[];
-};
-
-// Configuration uniforms
-layout(std140, binding = 1) uniform ConfigBuffer {
-    uint arraySize;        // Total size of the array
-    float sortThreshold;   // Threshold for switching to full radix sort
-    uint minGroupSize;     // Minimum group size (e.g., 3)
-    float sortScale;       // Scale factor for number of sorts (e.g., 2.0)
-};
-
-// Random number generation
-uint wang_hash(uint seed) {
-    seed = (seed ^ 61) ^ (seed >> 16);
-    seed *= 9;
-    seed = seed ^ (seed >> 4);
-    seed *= 0x27d4eb2d;
-    seed = seed ^ (seed >> 15);
-    return seed;
+// Enhanced hash for better distribution
+uint hash(uint x) {
+    x = (x ^ 61) ^ (x >> 16);
+    x *= 9;
+    x = x ^ (x >> 4);
+    x *= 0x27d4eb2d;
+    x = x ^ (x >> 15);
+    return x;
 }
 
-// Swap operation
-void swap(uint a, uint b) {
-    uint temp = data[a];
-    data[a] = data[b];
-    data[b] = temp;
-}
-
-// Insertion sort for first elements of groups
-void insertionSortFirstElements(uint groupIndex, uint groupSize) {
-    uint firstElement = data[groupIndex * groupSize];
-    uint j = groupIndex;
-    
-    while (j > 0 && data[(j-1) * groupSize] > firstElement) {
-        // Swap entire groups
-        for (uint k = 0; k < groupSize; k++) {
-            swap((j-1) * groupSize + k, j * groupSize + k);
-        }
-        j--;
-    }
-}
-
-// Calculate number of sorts based on array size
-uint calculateSortsPerGroup() {
-    return uint(sqrt(float(arraySize)) * sortScale);
-}
-
-// Random sort within groups - only adjacent pairs
-void randomSortGroup(uint groupStart, uint groupSize, uint sortsPerGroup) {
-    if (groupSize <= 1) return;
-    
-    uint seed = gl_GlobalInvocationID.x + groupStart;
-    uint maxStartIdx = groupStart + groupSize - 2;
-    
-    // Each group gets sortsPerGroup attempts
-    for (uint i = 0; i < sortsPerGroup; i++) {
-        seed = wang_hash(seed);
-        // Pick random adjacent pair within group
-        uint idx = groupStart + (seed % (groupSize - 1));
-        
-        // Compare and swap if needed
-        if (data[idx] > data[idx + 1]) {
-            swap(idx, idx + 1);
-        }
-    }
-}
-
-// Check if array section needs full sort
-bool needsFullSort(uint start, uint size) {
-    uint outOfOrder = 0;
-    uint threshold = uint(float(size) * sortThreshold);
-    
-    for (uint i = start + 1; i < start + size; i++) {
-        if (data[i] < data[i-1]) {
-            outOfOrder++;
-            if (outOfOrder > threshold) return true;
-        }
-    }
-    return false;
-}
-
-// Full radix sort implementation for when array is very unsorted
-void radixSort(uint start, uint size) {
-    uint maxVal = 0;
-    for (uint i = start; i < start + size; i++) {
-        maxVal = max(maxVal, data[i]);
-    }
-    
-    for (uint bit = 0; bit < 32; bit++) {
-        uint mask = 1u << bit;
-        if ((maxVal & mask) == 0) continue;
-        
-        // Count zeros and ones
-        uint zeros = 0;
-        for (uint i = start; i < start + size; i++) {
-            if ((data[i] & mask) == 0) zeros++;
-        }
-        
-        // Rearrange elements
-        uint zeroPos = start;
-        uint onePos = start + zeros;
-        uint[] temp = uint[](data);
-        
-        for (uint i = start; i < start + size; i++) {
-            if ((temp[i] & mask) == 0) {
-                data[zeroPos++] = temp[i];
-            } else {
-                data[onePos++] = temp[i];
-            }
-        }
-    }
+// Non-linear Kumaraswamy transform
+float biased_kumaraswamy(float u, float viewport_ratio) {
+    float base = 1.0 - sqrt(1.0 - u); // Original K(a=1,b=2)
+    return base * exp(-4.0 * base / viewport_ratio); // Exponential decay
 }
 
 void main() {
-    uint gid = gl_GlobalInvocationID.x;
-    if (gid >= arraySize) return;
+    const uint max_patch = 10;
+    const uint n = data.length();
+    const float viewport_focus = 0.01; // Focus on first 1% of array
     
-    // Calculate sort count first
-    uint sortsPerGroup = calculateSortsPerGroup();
+    // Hierarchical processing segments
+    uint segment_size = uint(n * viewport_focus);
+    uint segment_start = gl_WorkGroupID.x * segment_size;
+    uint segment_end = min(segment_start + segment_size, n);
     
-    // Calculate group parameters
-    uint groupIndex = gid;
-    uint groupSize = minGroupSize + groupIndex; // Linear growth starting from minGroupSize
-    uint groupStart = groupIndex * groupSize;
+    if (segment_start >= n) return;
+
+    // Thread-specific randomization
+    uint seed = hash(gl_GlobalInvocationID.x + uint(1e7 * gl_NumWorkGroups.x));
+    float u = float(seed & 0xFFFF) / 0xFFFF;
     
-    // Early exit if beyond array bounds
-    if (groupStart >= arraySize) return;
+    // Apply non-linear probability distribution
+    float k = biased_kumaraswamy(u, viewport_focus);
+    uint local_start = uint(k * (segment_end - segment_start - max_patch));
+    uint global_start = segment_start + local_start;
     
-    // Adjust group size for array bounds
-    groupSize = min(groupSize, arraySize - groupStart);
+    // Position-based processing probability
+    float depth_decay = exp(-8.0 * float(global_start)/float(n));
+    if (float(hash(seed+123) & 0xFFFF)/0xFFFF > depth_decay) return;
+
+    // Generate patch and sort
+    uint patch_size = (hash(seed) % 9) + 2;
+    uint patch_end = min(global_start + patch_size, n);
     
-    // Check if section needs full sort
-    if (needsFullSort(groupStart, groupSize)) {
-        radixSort(groupStart, groupSize);
-        return;
+    if (patch_end - global_start < 2) return;
+
+    // LSB radix pass with XOR swap
+    for (uint i = global_start; i < patch_end - 1; i++) {
+        uint a = data[i];
+        uint b = data[i+1];
+        uint lsb_mask = 0x1;
+        
+        if ((a & lsb_mask) > (b & lsb_mask)) {
+            a ^= b;
+            b ^= a;
+            a ^= b;
+            
+            data[i] = a;
+            data[i+1] = b;
+        }
     }
-    
-    // Sort first elements of groups
-    insertionSortFirstElements(groupIndex, groupSize);
-    
-    // Random sort within group using calculated sort count
-    randomSortGroup(groupStart, groupSize, sortsPerGroup);
-    
-    memoryBarrier();
 }

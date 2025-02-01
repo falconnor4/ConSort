@@ -1,3 +1,5 @@
+//WARNING THIS FILE IS OUTDATED AND KINDA BULLSHIT. LOOK AT THE OTHER FILE INSTEAD
+
 struct Config {
     arraySize: u32,
     sortThreshold: f32,
