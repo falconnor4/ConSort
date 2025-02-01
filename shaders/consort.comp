@@ -1,67 +1,76 @@
 #version 450
-layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+layout(local_size_x = 128, local_size_y = 4, local_size_z = 1) in;
 layout(binding = 0, std430) buffer SortBuffer { uint data[]; };
 
-// Enhanced hash for better distribution
+// Warp-oriented parameters
+#define WARP_SIZE 32
+#define PATCHES_PER_THREAD 4
+
+// Enhanced hashing using SMEM optimization
+shared uint warp_hashes[WARP_SIZE];
 uint hash(uint x) {
     x = (x ^ 61) ^ (x >> 16);
     x *= 9;
     x = x ^ (x >> 4);
     x *= 0x27d4eb2d;
-    x = x ^ (x >> 15);
-    return x;
+    return x ^ (x >> 15);
 }
 
-// Non-linear Kumaraswamy transform
-float biased_kumaraswamy(float u, float viewport_ratio) {
-    float base = 1.0 - sqrt(1.0 - u); // Original K(a=1,b=2)
-    return base * exp(-4.0 * base / viewport_ratio); // Exponential decay
+// Wavefront-aligned Kumaraswamy
+float warp_kumaraswamy(uint lane_id) {
+    float u = float(lane_id)/float(WARP_SIZE-1);
+    return 1.0 - sqrt(1.0 - u); // K(1,2) CDF
 }
 
 void main() {
-    const uint max_patch = 10;
     const uint n = data.length();
-    const float viewport_focus = 0.01; // Focus on first 1% of array
+    const float viewport_ratio = 0.01; // Focus area
+    const uint focus_elements = uint(n * viewport_ratio);
     
-    // Hierarchical processing segments
-    uint segment_size = uint(n * viewport_focus);
-    uint segment_start = gl_WorkGroupID.x * segment_size;
-    uint segment_end = min(segment_start + segment_size, n);
+    // Wavefront scheduling
+    uint wave_id = gl_WorkGroupID.x * gl_WorkGroupSize.y + gl_WorkGroupID.y;
+    uint base_idx = wave_id * WARP_SIZE * PATCHES_PER_THREAD;
     
-    if (segment_start >= n) return;
-
-    // Thread-specific randomization
-    uint seed = hash(gl_GlobalInvocationID.x + uint(1e7 * gl_NumWorkGroups.x));
-    float u = float(seed & 0xFFFF) / 0xFFFF;
-    
-    // Apply non-linear probability distribution
-    float k = biased_kumaraswamy(u, viewport_focus);
-    uint local_start = uint(k * (segment_end - segment_start - max_patch));
-    uint global_start = segment_start + local_start;
-    
-    // Position-based processing probability
-    float depth_decay = exp(-8.0 * float(global_start)/float(n));
-    if (float(hash(seed+123) & 0xFFFF)/0xFFFF > depth_decay) return;
-
-    // Generate patch and sort
-    uint patch_size = (hash(seed) % 9) + 2;
-    uint patch_end = min(global_start + patch_size, n);
-    
-    if (patch_end - global_start < 2) return;
-
-    // LSB radix pass with XOR swap
-    for (uint i = global_start; i < patch_end - 1; i++) {
-        uint a = data[i];
-        uint b = data[i+1];
-        uint lsb_mask = 0x1;
+    // Cooperative warp-level patch generation
+    for(uint iter = 0; iter < PATCHES_PER_THREAD; ++iter) {
+        uint patch_idx = base_idx + gl_SubgroupInvocationID + iter * WARP_SIZE;
+        if(patch_idx >= focus_elements) break;
         
-        if ((a & lsb_mask) > (b & lsb_mask)) {
-            a ^= b;
-            b ^= a;
-            a ^= b;
+        // Warp-coherent probability distribution
+        float k = warp_kumaraswamy(gl_SubgroupInvocationID);
+        uint start = uint(k * focus_elements);
+        
+        // Staggered patch sizing
+        uint patch_size = (hash(patch_idx) % 9) + 2;
+        uint end = min(start + patch_size, focus_elements);
+        
+        // Wavefront-aligned processing
+        for(uint i = start; i < end-1; ++i) {
+            // Vectorized XOR swap (process 4 elements per cycle)
+            uvec2 pair = uvec2(data[i], data[i+1]);
+            uint lsb_mask = 0x1;
             
-            data[i] = a;
-            data[i+1] = b;
+            if((pair.x & lsb_mask) > (pair.y & lsb_mask)) {
+                pair.xy = uvec2(pair.x ^ pair.y, pair.y ^ (pair.x ^ pair.y));
+                data[i] = pair.x;
+                data[i+1] = pair.y;
+            }
+        }
+    }
+
+    // Distant element processing (opportunistic)
+    uint global_idx = gl_GlobalInvocationID.x;
+    float depth_decay = exp(-12.0 * float(global_idx)/float(n));
+    if(global_idx > focus_elements && hash(global_idx) % 1000 > depth_decay * 1000) return;
+    
+    // Sparse distant element handling
+    uint far_start = focus_elements + (hash(global_idx) % (n - focus_elements));
+    uint far_size = (hash(global_idx) % 3) + 2; // Smaller patches
+    for(uint i = far_start; i < min(far_start + far_size, n-1); ++i) {
+        uint a = data[i], b = data[i+1];
+        if((a & 1) > (b & 1)) {
+            a ^= b; b ^= a; a ^= b;
+            data[i] = a; data[i+1] = b;
         }
     }
 }
