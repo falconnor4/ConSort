@@ -19,7 +19,7 @@ uint hash(uint x) {
 // Wavefront-aligned Kumaraswamy
 float warp_kumaraswamy(uint lane_id) {
     float u = float(lane_id)/float(WARP_SIZE-1);
-    return 1.0 - sqrt(1.0 - u); // K(1,2) CDF
+    return 1.0 - sqrt(1.0 - u); // K(1,2) CDF (maybe swap to a = 1.5?)
 }
 
 void main() {
